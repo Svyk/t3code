@@ -3,6 +3,7 @@ import { TurnId } from "@t3tools/contracts";
 
 import {
   buildGrokBackgroundTaskEvents,
+  buildGrokTaskCompletedEvents,
   type GrokBackgroundTaskRecord,
 } from "./XAiBackgroundTasks.ts";
 
@@ -199,4 +200,180 @@ describe("Grok background tasks", () => {
     expect(update(output)).toEqual([]);
     expect(tasks.size).toBe(0);
   });
+});
+
+describe("Grok task_completed notices", () => {
+  const monitorTaskId = "01a074d8-7c7f-7903-991f-1c9276e6e058";
+  const monitorDescription = "Watch t3-plan draft until DONE/FAILED";
+
+  function taskCompletedNotice(
+    overrides: {
+      task_id?: string;
+      exit_code?: number | null;
+      signal?: string | null;
+      explicitly_killed?: boolean;
+      completed?: boolean;
+      output?: string;
+      kind?: string;
+    } = {},
+  ) {
+    return {
+      sessionId: "01a074d2-6fe5-79a2-8e2c-85686250e5ee",
+      update: {
+        sessionUpdate: "task_completed",
+        task_snapshot: {
+          task_id: monitorTaskId,
+          command: "python3 /tmp/example/watch.py --unit t3-draft",
+          display_command: `[monitor] ${monitorDescription}`,
+          description: monitorDescription,
+          kind: "monitor",
+          exit_code: 0,
+          signal: null,
+          explicitly_killed: false,
+          completed: true,
+          is_backgrounded: true,
+          output: "DONE t3-draft\n",
+          start_time: 1_788_666_700.1,
+          end_time: 1_788_666_972.0,
+          ...overrides,
+        },
+        will_wake: true,
+      },
+    };
+  }
+
+  function seedMonitor(tasks: Map<string, GrokBackgroundTaskRecord>, taskTurnId = turnId) {
+    buildGrokBackgroundTaskEvents({
+      tasks,
+      toolCallId: "call-1",
+      rawInput: { description: monitorDescription },
+      rawOutput: { type: "Monitor", taskId: monitorTaskId, timeoutMs: 60_000 },
+      toolCallStatus: "completed",
+      turnId: taskTurnId,
+    });
+  }
+
+  it("completes a known monitor from a task_completed notice", () => {
+    const tasks = new Map<string, GrokBackgroundTaskRecord>();
+    seedMonitor(tasks);
+    const events = buildGrokTaskCompletedEvents({
+      tasks,
+      notification: taskCompletedNotice(),
+      turnId: TurnId.make("turn-2"),
+    });
+    expect(events).toEqual([
+      {
+        type: "task.completed",
+        payload: {
+          taskId: monitorTaskId,
+          taskType: "monitor",
+          description: monitorDescription,
+          title: monitorDescription,
+          toolUseId: "call-1",
+          status: "completed",
+          summary: "DONE t3-draft",
+        },
+      },
+    ]);
+    expect(tasks.size).toBe(0);
+  });
+
+  it("maps a non-zero exit code to failed", () => {
+    const tasks = new Map<string, GrokBackgroundTaskRecord>();
+    seedMonitor(tasks);
+    const events = buildGrokTaskCompletedEvents({
+      tasks,
+      notification: taskCompletedNotice({ exit_code: 1, output: "FAILED pages\n" }),
+    });
+    const completed = events.find((event) => event.type === "task.completed");
+    expect(completed?.payload.status).toBe("failed");
+    expect(tasks.size).toBe(0);
+  });
+
+  it("maps explicitly killed bash tasks to stopped", () => {
+    const tasks = new Map<string, GrokBackgroundTaskRecord>();
+    seedMonitor(tasks);
+    const events = buildGrokTaskCompletedEvents({
+      tasks,
+      notification: taskCompletedNotice({
+        kind: "bash",
+        exit_code: null,
+        signal: "killed",
+        explicitly_killed: true,
+        output: "",
+      }),
+    });
+    const completed = events.find((event) => event.type === "task.completed");
+    expect(completed?.payload.status).toBe("stopped");
+    expect(tasks.size).toBe(0);
+  });
+
+  it("ignores incomplete snapshots", () => {
+    const tasks = new Map<string, GrokBackgroundTaskRecord>();
+    seedMonitor(tasks);
+    expect(
+      buildGrokTaskCompletedEvents({
+        tasks,
+        notification: taskCompletedNotice({ completed: false }),
+      }),
+    ).toEqual([]);
+    expect(tasks.size).toBe(1);
+  });
+
+  it("ignores unknown task ids without starting a task", () => {
+    const tasks = new Map<string, GrokBackgroundTaskRecord>();
+    expect(
+      buildGrokTaskCompletedEvents({
+        tasks,
+        notification: taskCompletedNotice({ task_id: "unknown-task" }),
+      }),
+    ).toEqual([]);
+    expect(tasks.size).toBe(0);
+  });
+
+  it("ignores unrelated session/update kinds", () => {
+    const tasks = new Map<string, GrokBackgroundTaskRecord>();
+    seedMonitor(tasks);
+    expect(
+      buildGrokTaskCompletedEvents({
+        tasks,
+        notification: {
+          sessionId: "session-1",
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "hello" },
+          },
+        },
+      }),
+    ).toEqual([]);
+    expect(tasks.size).toBe(1);
+  });
+
+  it("deduplicates dual delivery across both methods", () => {
+    const tasks = new Map<string, GrokBackgroundTaskRecord>();
+    seedMonitor(tasks);
+    const notice = taskCompletedNotice();
+    const first = buildGrokTaskCompletedEvents({ tasks, notification: notice });
+    const second = buildGrokTaskCompletedEvents({ tasks, notification: notice });
+    expect(first).toHaveLength(1);
+    expect(second).toEqual([]);
+    expect(tasks.size).toBe(0);
+  });
+
+  it.each([
+    [TurnId.make("turn-2"), undefined],
+    [turnId, turnId],
+  ])(
+    "attributes completion to the originating turn only when it matches: %s",
+    (noticeTurnId, expectedTurnId) => {
+      const tasks = new Map<string, GrokBackgroundTaskRecord>();
+      seedMonitor(tasks);
+      const events = buildGrokTaskCompletedEvents({
+        tasks,
+        notification: taskCompletedNotice(),
+        turnId: noticeTurnId,
+      });
+      expect(events[0]?.turnId).toBe(expectedTurnId);
+    },
+  );
 });

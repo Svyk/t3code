@@ -233,6 +233,102 @@ it.layer(grokAdapterTestLayer)("GrokAdapterLive", (it) => {
     }),
   );
 
+  it.effect("closes a monitor when Grok sends task_completed after the turn ends", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("grok-monitor-task-completed");
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockGrokWrapper({ T3_ACP_EMIT_GROK_MONITOR_POST_TURN_TASK_COMPLETED: "1" }),
+      );
+      const adapter = yield* makeTestAdapter(wrapperPath);
+      const events: ProviderRuntimeEvent[] = [];
+      const finished = yield* Deferred.make<void>();
+      const eventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.gen(function* () {
+          events.push(event);
+          if (event.type === "task.completed") {
+            yield* Deferred.succeed(finished, undefined);
+          }
+        }),
+      ).pipe(Effect.forkChild);
+      yield* adapter.startSession({ threadId, cwd: process.cwd(), runtimeMode: "full-access" });
+      yield* adapter.sendTurn({ threadId, input: "watch the unit" });
+      yield* Deferred.await(finished).pipe(Effect.timeout("3 seconds"));
+
+      const taskId = "01a05f41-5107-7550-821e-79e8d1cd7687";
+      const started = events.find((event) => event.type === "task.started");
+      const completed = events.find((event) => event.type === "task.completed");
+      const turnEnd = events.findIndex((event) => event.type === "turn.completed");
+      assert.equal(started?.payload.taskId, taskId);
+      assert.equal(completed?.payload.status, "completed");
+      assert.equal(completed?.payload.taskId, taskId);
+      assert.equal(completed?.turnId, undefined);
+      assert.isAtLeast(turnEnd, 0);
+      assert.isAbove(
+        events.findIndex((event) => event.type === "task.completed"),
+        turnEnd,
+      );
+      yield* Fiber.interrupt(eventsFiber);
+      yield* adapter.stopSession(threadId);
+    }).pipe(TestClock.withLive),
+  );
+
+  it.effect("does not clear a live monitor without a task_completed notice", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("grok-monitor-task-completed-regression");
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockGrokWrapper({ T3_ACP_EMIT_GROK_MONITOR_POST_TURN_HANG: "1" }),
+      );
+      const adapter = yield* makeTestAdapter(wrapperPath);
+      const events: ProviderRuntimeEvent[] = [];
+      const turnCompleted = yield* Deferred.make<void>();
+      const eventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.gen(function* () {
+          events.push(event);
+          if (event.type === "turn.completed") {
+            yield* Deferred.succeed(turnCompleted, undefined);
+          }
+        }),
+      ).pipe(Effect.forkChild);
+      yield* adapter.startSession({ threadId, cwd: process.cwd(), runtimeMode: "full-access" });
+      yield* adapter.sendTurn({ threadId, input: "watch the unit" });
+      yield* Deferred.await(turnCompleted).pipe(Effect.timeout("3 seconds"));
+      yield* Effect.sleep("200 millis");
+
+      assert.isUndefined(events.find((event) => event.type === "task.completed"));
+      assert.isDefined(events.find((event) => event.type === "task.started"));
+      yield* Fiber.interrupt(eventsFiber);
+      yield* adapter.stopSession(threadId);
+    }).pipe(TestClock.withLive),
+  );
+
+  it.effect("deduplicates dual task_completed delivery across both methods", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("grok-monitor-task-completed-dual");
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockGrokWrapper({ T3_ACP_EMIT_GROK_MONITOR_POST_TURN_TASK_COMPLETED_DUAL: "1" }),
+      );
+      const adapter = yield* makeTestAdapter(wrapperPath);
+      const events: ProviderRuntimeEvent[] = [];
+      const finished = yield* Deferred.make<void>();
+      const eventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.gen(function* () {
+          events.push(event);
+          if (event.type === "task.completed") {
+            yield* Deferred.succeed(finished, undefined);
+          }
+        }),
+      ).pipe(Effect.forkChild);
+      yield* adapter.startSession({ threadId, cwd: process.cwd(), runtimeMode: "full-access" });
+      yield* adapter.sendTurn({ threadId, input: "watch the unit" });
+      yield* Deferred.await(finished).pipe(Effect.timeout("3 seconds"));
+      yield* Effect.sleep("200 millis");
+
+      assert.equal(events.filter((event) => event.type === "task.completed").length, 1);
+      yield* Fiber.interrupt(eventsFiber);
+      yield* adapter.stopSession(threadId);
+    }).pipe(TestClock.withLive),
+  );
+
   for (const taskType of ["monitor", "shell"] as const) {
     it.effect(`emits the ${taskType} background lifecycle`, () =>
       Effect.gen(function* () {

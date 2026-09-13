@@ -70,6 +70,7 @@ import {
 } from "../acp/GrokAcpSupport.ts";
 import {
   buildGrokBackgroundTaskEvents,
+  buildGrokTaskCompletedEvents,
   type GrokBackgroundTaskRecord,
 } from "../acp/XAiBackgroundTasks.ts";
 import {
@@ -1139,6 +1140,36 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                       return makeXAiExitPlanModeCapturedResponse();
                     }),
                   ),
+                ),
+              { discard: true },
+            );
+            const handleGrokTaskCompletedNotification = (method: string) => (params: unknown) =>
+              mapAcpCallbackFailure(
+                Effect.gen(function* () {
+                  const ctx = sessions.get(input.threadId);
+                  if (!ctx || ctx.stopped) return;
+                  yield* logNative(ctx.threadId, method, params);
+                  for (const taskEvent of buildGrokTaskCompletedEvents({
+                    tasks: ctx.backgroundTasks,
+                    notification: params,
+                    turnId: resolveNotificationTurnId(ctx),
+                  })) {
+                    yield* offerRuntimeEvent({
+                      ...taskEvent,
+                      ...(yield* makeEventStamp()),
+                      provider: PROVIDER,
+                      threadId: ctx.threadId,
+                    });
+                  }
+                }),
+              );
+            yield* Effect.forEach(
+              ["_x.ai/task_completed", "_x.ai/session/update"] as const,
+              (method) =>
+                acp.handleExtNotification(
+                  method,
+                  Schema.Unknown,
+                  handleGrokTaskCompletedNotification(method),
                 ),
               { discard: true },
             );

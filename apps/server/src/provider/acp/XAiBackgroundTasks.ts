@@ -57,6 +57,60 @@ function lifecycle(status: unknown, exitCode: unknown) {
   }
 }
 
+function taskAttribution(task: GrokBackgroundTaskRecord, turnId?: TurnId | undefined) {
+  return task.turnId !== undefined && task.turnId === turnId ? { turnId } : {};
+}
+
+function completeTask(
+  tasks: Map<string, GrokBackgroundTaskRecord>,
+  task: GrokBackgroundTaskRecord,
+  status: "completed" | "failed" | "stopped",
+  turnId?: TurnId | undefined,
+  summary?: string,
+): TaskEvent {
+  tasks.delete(task.payload.taskId);
+  return {
+    type: "task.completed",
+    payload: { ...task.payload, status, ...(summary ? { summary } : {}) },
+    ...taskAttribution(task, turnId),
+  };
+}
+
+/** Close a known monitor/shell when Grok emits task_completed (ACP ext notification). */
+export function buildGrokTaskCompletedEvents(input: {
+  readonly tasks: Map<string, GrokBackgroundTaskRecord>;
+  readonly notification: unknown;
+  readonly turnId?: TurnId | undefined;
+}): TaskEvent[] {
+  const update = record(record(input.notification).update);
+  if (update.sessionUpdate !== "task_completed") return [];
+
+  const snapshot = record(update.task_snapshot);
+  const id = text(snapshot.task_id);
+  if (!id || snapshot.completed !== true) return [];
+
+  const task = input.tasks.get(id);
+  if (!task) return [];
+
+  let status: ReturnType<typeof lifecycle>;
+  if (snapshot.explicitly_killed === true) {
+    status = "stopped";
+  } else {
+    status = lifecycle(snapshot.status, snapshot.exit_code);
+    if (status === undefined && text(snapshot.signal)) {
+      status = "stopped";
+    }
+  }
+  if (status === undefined || status === "running") return [];
+
+  const summary = text(snapshot.output)
+    ?.split("\n")
+    .find((line) => line.trim())
+    ?.trim();
+
+  return [completeTask(input.tasks, task, status, input.turnId, summary)];
+}
+
 /** Map Grok's discriminated tool results, including notifications after the turn ends. */
 export function buildGrokBackgroundTaskEvents(input: {
   readonly tasks: Map<string, GrokBackgroundTaskRecord>;
@@ -76,8 +130,6 @@ export function buildGrokBackgroundTaskEvents(input: {
   ) {
     return events;
   }
-  const attribution = (task: GrokBackgroundTaskRecord) =>
-    task.turnId !== undefined && task.turnId === turnId ? { turnId } : {};
   const start = (
     id: string,
     taskType: "monitor" | "shell",
@@ -98,7 +150,7 @@ export function buildGrokBackgroundTaskEvents(input: {
       turnId: toolUseId ? turnId : undefined,
     };
     tasks.set(id, task);
-    events.push({ type: "task.started", payload: task.payload, ...attribution(task) });
+    events.push({ type: "task.started", payload: task.payload, ...taskAttribution(task, turnId) });
     return task;
   };
   const complete = (
@@ -106,12 +158,7 @@ export function buildGrokBackgroundTaskEvents(input: {
     status: "completed" | "failed" | "stopped",
     summary?: string,
   ) => {
-    tasks.delete(task.payload.taskId);
-    events.push({
-      type: "task.completed",
-      payload: { ...task.payload, status, ...(summary ? { summary } : {}) },
-      ...attribution(task),
-    });
+    events.push(completeTask(tasks, task, status, turnId, summary));
   };
 
   if (output.type === "Monitor" && toolCallStatus === "completed") {
@@ -145,7 +192,7 @@ export function buildGrokBackgroundTaskEvents(input: {
         events.push({
           type: "task.progress",
           payload: { ...task.payload, ...(summary ? { summary } : {}) },
-          ...attribution(task),
+          ...taskAttribution(task, turnId),
         });
       } else {
         complete(task, status, summary);
