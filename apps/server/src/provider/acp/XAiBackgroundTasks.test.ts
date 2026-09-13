@@ -4,6 +4,8 @@ import { TurnId } from "@t3tools/contracts";
 import {
   buildGrokBackgroundTaskEvents,
   buildGrokTaskCompletedEvents,
+  grokTaskCompletedNoticeId,
+  rememberPendingTaskCompletion,
   type GrokBackgroundTaskRecord,
 } from "./XAiBackgroundTasks.ts";
 
@@ -376,4 +378,82 @@ describe("Grok task_completed notices", () => {
       expect(events[0]?.turnId).toBe(expectedTurnId);
     },
   );
+});
+
+describe("grokTaskCompletedNoticeId", () => {
+  const monitorTaskId = "01a074d8-7c7f-7903-991f-1c9276e6e058";
+
+  function notice(
+    overrides: {
+      task_id?: string;
+      completed?: boolean;
+      kind?: string;
+      sessionUpdate?: string;
+    } = {},
+  ) {
+    const { sessionUpdate = "task_completed", ...snapshotOverrides } = overrides;
+    return {
+      sessionId: "session-1",
+      update: {
+        sessionUpdate,
+        task_snapshot: {
+          task_id: monitorTaskId,
+          kind: "monitor",
+          completed: true,
+          ...snapshotOverrides,
+        },
+      },
+    };
+  }
+
+  it("returns the id for a completed monitor notice", () => {
+    expect(grokTaskCompletedNoticeId(notice())).toBe(monitorTaskId);
+  });
+
+  it.each([
+    ["completed: false", { completed: false }],
+    ["kind subagent", { kind: "subagent" }],
+    ["non-task_completed sessionUpdate", { sessionUpdate: "agent_message_chunk" }],
+    ["missing task_id", { task_id: " " }],
+  ])("returns undefined for %s", (_label, overrides) => {
+    expect(grokTaskCompletedNoticeId(notice(overrides))).toBeUndefined();
+  });
+});
+
+describe("rememberPendingTaskCompletion", () => {
+  const makeNotice = (id: string) => ({ update: { task_snapshot: { task_id: id } } });
+
+  it("inserts a pending completion", () => {
+    const pending = new Map<string, unknown>();
+    rememberPendingTaskCompletion(pending, "task-1", makeNotice("task-1"));
+    expect(pending.get("task-1")).toEqual(makeNotice("task-1"));
+  });
+
+  it("re-inserting an existing id moves it to newest", () => {
+    const pending = new Map<string, unknown>();
+    rememberPendingTaskCompletion(pending, "task-1", makeNotice("task-1"));
+    rememberPendingTaskCompletion(pending, "task-2", makeNotice("task-2"));
+    rememberPendingTaskCompletion(pending, "task-1", { refreshed: true });
+    expect([...pending.keys()]).toEqual(["task-2", "task-1"]);
+    expect(pending.get("task-1")).toEqual({ refreshed: true });
+  });
+
+  it("evicts the oldest entry when exceeding the cap", () => {
+    const pending = new Map<string, unknown>();
+    for (let i = 0; i < 3; i++) {
+      rememberPendingTaskCompletion(pending, `task-${i}`, makeNotice(`task-${i}`), 2);
+    }
+    expect([...pending.keys()]).toEqual(["task-1", "task-2"]);
+    expect(pending.has("task-0")).toBe(false);
+  });
+
+  it("uses a default cap of 100", () => {
+    const pending = new Map<string, unknown>();
+    for (let i = 0; i < 101; i++) {
+      rememberPendingTaskCompletion(pending, `task-${i}`, makeNotice(`task-${i}`));
+    }
+    expect(pending.size).toBe(100);
+    expect(pending.has("task-0")).toBe(false);
+    expect(pending.has("task-100")).toBe(true);
+  });
 });

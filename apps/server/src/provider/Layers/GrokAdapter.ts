@@ -71,6 +71,8 @@ import {
 import {
   buildGrokBackgroundTaskEvents,
   buildGrokTaskCompletedEvents,
+  grokTaskCompletedNoticeId,
+  rememberPendingTaskCompletion,
   type GrokBackgroundTaskRecord,
 } from "../acp/XAiBackgroundTasks.ts";
 import {
@@ -178,6 +180,8 @@ interface GrokSessionContext {
   stopped: boolean;
   /** Live monitor/shell identities and their originating turns. */
   readonly backgroundTasks: Map<string, GrokBackgroundTaskRecord>;
+  /** task_completed notices received before the matching start was processed. */
+  readonly pendingTaskCompletions: Map<string, unknown>;
 }
 
 function settlePendingApprovalsAsCancelled(
@@ -1149,11 +1153,19 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                   const ctx = sessions.get(input.threadId);
                   if (!ctx || ctx.stopped) return;
                   yield* logNative(ctx.threadId, method, params);
-                  for (const taskEvent of buildGrokTaskCompletedEvents({
+                  // Handlers run inside the single ACP read loop; must not block (no drainEvents).
+                  const events = buildGrokTaskCompletedEvents({
                     tasks: ctx.backgroundTasks,
                     notification: params,
                     turnId: resolveNotificationTurnId(ctx),
-                  })) {
+                  });
+                  if (events.length === 0) {
+                    const id = grokTaskCompletedNoticeId(params);
+                    if (id && !ctx.backgroundTasks.has(id)) {
+                      rememberPendingTaskCompletion(ctx.pendingTaskCompletions, id, params);
+                    }
+                  }
+                  for (const taskEvent of events) {
                     yield* offerRuntimeEvent({
                       ...taskEvent,
                       ...(yield* makeEventStamp()),
@@ -1347,6 +1359,7 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                 : currentStartReasoningEffort,
             stopped: false,
             backgroundTasks: new Map(),
+            pendingTaskCompletions: new Map(),
           };
 
           const nf = yield* Stream.runDrain(
@@ -1384,6 +1397,24 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                       provider: PROVIDER,
                       threadId: ctx.threadId,
                     });
+                    if (taskEvent.type === "task.started") {
+                      const stored = ctx.pendingTaskCompletions.get(taskEvent.payload.taskId);
+                      if (stored !== undefined) {
+                        ctx.pendingTaskCompletions.delete(taskEvent.payload.taskId);
+                        for (const completedEvent of buildGrokTaskCompletedEvents({
+                          tasks: ctx.backgroundTasks,
+                          notification: stored,
+                          turnId: notificationTurnId,
+                        })) {
+                          yield* offerRuntimeEvent({
+                            ...completedEvent,
+                            ...(yield* makeEventStamp()),
+                            provider: PROVIDER,
+                            threadId: ctx.threadId,
+                          });
+                        }
+                      }
+                    }
                   }
                 }
 

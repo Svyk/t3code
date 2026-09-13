@@ -36,6 +36,10 @@ const emitGrokMonitorPostTurnTaskCompleted =
   process.env.T3_ACP_EMIT_GROK_MONITOR_POST_TURN_TASK_COMPLETED === "1";
 const emitGrokMonitorPostTurnTaskCompletedDual =
   process.env.T3_ACP_EMIT_GROK_MONITOR_POST_TURN_TASK_COMPLETED_DUAL === "1";
+const emitGrokMonitorTaskCompletedBeforeStart =
+  process.env.T3_ACP_EMIT_GROK_MONITOR_TASK_COMPLETED_BEFORE_START === "1";
+const emitGrokMonitorOrphanTaskCompleted =
+  process.env.T3_ACP_EMIT_GROK_MONITOR_ORPHAN_TASK_COMPLETED === "1";
 const emitGrokBackgroundTaskStarted = process.env.T3_ACP_EMIT_GROK_BACKGROUND_TASK_STARTED === "1";
 const emitForeignSessionUpdates = process.env.T3_ACP_EMIT_FOREIGN_SESSION_UPDATES === "1";
 const waitForResumeRelease = process.env.T3_ACP_WAIT_FOR_RESUME_RELEASE === "1";
@@ -928,6 +932,51 @@ const program = Effect.gen(function* () {
               },
             },
           },
+        });
+        return yield* Effect.never;
+      }
+
+      if (emitGrokMonitorTaskCompletedBeforeStart) {
+        writeJsonRpcNotification("_x.ai/task_completed", grokMonitorTaskCompletedParams());
+        emitGrokMonitorStarted();
+        writeJsonRpcNotification("_x.ai/session/prompt_complete", {
+          sessionId: requestedSessionId,
+          promptId: promptIdFromRequestMeta(request) ?? "mock-xai-prompt-1",
+          stopReason: "end_turn",
+          agentResult: null,
+        });
+        return yield* Effect.never;
+      }
+
+      if (emitGrokMonitorOrphanTaskCompleted) {
+        writeJsonRpcNotification("_x.ai/task_completed", {
+          sessionId: requestedSessionId,
+          update: {
+            sessionUpdate: "task_completed",
+            task_snapshot: {
+              task_id: "orphan-task-never-started",
+              command: "python3 /tmp/example/watch.py --unit orphan",
+              display_command: "[monitor] Orphan watch",
+              description: "Orphan watch",
+              kind: "monitor",
+              exit_code: 0,
+              signal: null,
+              explicitly_killed: false,
+              completed: true,
+              is_backgrounded: true,
+              output: "DONE orphan\n",
+              start_time: 1_788_666_700.1,
+              end_time: 1_788_666_972.0,
+            },
+            will_wake: true,
+          },
+        });
+        emitGrokMonitorStarted();
+        writeJsonRpcNotification("_x.ai/session/prompt_complete", {
+          sessionId: requestedSessionId,
+          promptId: promptIdFromRequestMeta(request) ?? "mock-xai-prompt-1",
+          stopReason: "end_turn",
+          agentResult: null,
         });
         return yield* Effect.never;
       }

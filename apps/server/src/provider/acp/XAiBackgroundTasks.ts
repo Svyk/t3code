@@ -76,19 +76,43 @@ function completeTask(
   };
 }
 
+/** The task id of a completed Grok task_completed notice, or undefined. */
+export function grokTaskCompletedNoticeId(notification: unknown): string | undefined {
+  const update = record(record(notification).update);
+  if (update.sessionUpdate !== "task_completed") return undefined;
+
+  const snapshot = record(update.task_snapshot);
+  if (snapshot.completed !== true || snapshot.kind === "subagent") return undefined;
+
+  return text(snapshot.task_id);
+}
+
+/** Remember a completion whose task T3 has not started yet (bounded, oldest evicted). */
+export function rememberPendingTaskCompletion(
+  pending: Map<string, unknown>,
+  taskId: string,
+  notification: unknown,
+  cap = 100,
+): void {
+  pending.delete(taskId);
+  pending.set(taskId, notification);
+  if (pending.size > cap) {
+    const oldest = pending.keys().next().value;
+    if (oldest !== undefined) pending.delete(oldest);
+  }
+}
+
 /** Close a known monitor/shell when Grok emits task_completed (ACP ext notification). */
 export function buildGrokTaskCompletedEvents(input: {
   readonly tasks: Map<string, GrokBackgroundTaskRecord>;
   readonly notification: unknown;
   readonly turnId?: TurnId | undefined;
 }): TaskEvent[] {
+  const id = grokTaskCompletedNoticeId(input.notification);
+  if (!id) return [];
+
   const update = record(record(input.notification).update);
-  if (update.sessionUpdate !== "task_completed") return [];
-
   const snapshot = record(update.task_snapshot);
-  const id = text(snapshot.task_id);
-  if (!id || snapshot.completed !== true) return [];
-
   const task = input.tasks.get(id);
   if (!task) return [];
 

@@ -329,6 +329,75 @@ it.layer(grokAdapterTestLayer)("GrokAdapterLive", (it) => {
     }).pipe(TestClock.withLive),
   );
 
+  it.effect("closes a monitor when task_completed arrives before the start event", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("grok-monitor-task-completed-before-start");
+      const taskId = "01a05f41-5107-7550-821e-79e8d1cd7687";
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockGrokWrapper({ T3_ACP_EMIT_GROK_MONITOR_TASK_COMPLETED_BEFORE_START: "1" }),
+      );
+      const adapter = yield* makeTestAdapter(wrapperPath);
+      const events: ProviderRuntimeEvent[] = [];
+      const finished = yield* Deferred.make<void>();
+      const eventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.gen(function* () {
+          events.push(event);
+          if (event.type === "task.completed") {
+            yield* Deferred.succeed(finished, undefined);
+          }
+        }),
+      ).pipe(Effect.forkChild);
+      yield* adapter.startSession({ threadId, cwd: process.cwd(), runtimeMode: "full-access" });
+      yield* adapter.sendTurn({ threadId, input: "watch the unit" });
+      yield* Deferred.await(finished).pipe(Effect.timeout("3 seconds"));
+
+      const started = events.find((event) => event.type === "task.started");
+      const completed = events.find((event) => event.type === "task.completed");
+      assert.equal(events.filter((event) => event.type === "task.started").length, 1);
+      assert.equal(events.filter((event) => event.type === "task.completed").length, 1);
+      assert.equal(started?.payload.taskId, taskId);
+      assert.equal(completed?.payload.status, "completed");
+      assert.equal(completed?.payload.taskId, taskId);
+      yield* Fiber.interrupt(eventsFiber);
+      yield* adapter.stopSession(threadId);
+    }).pipe(TestClock.withLive),
+  );
+
+  it.effect("ignores orphan task_completed notices without clearing live monitors", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("grok-monitor-orphan-task-completed");
+      const liveTaskId = "01a05f41-5107-7550-821e-79e8d1cd7687";
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockGrokWrapper({ T3_ACP_EMIT_GROK_MONITOR_ORPHAN_TASK_COMPLETED: "1" }),
+      );
+      const adapter = yield* makeTestAdapter(wrapperPath);
+      const events: ProviderRuntimeEvent[] = [];
+      const turnCompleted = yield* Deferred.make<void>();
+      const eventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.gen(function* () {
+          events.push(event);
+          if (event.type === "turn.completed") {
+            yield* Deferred.succeed(turnCompleted, undefined);
+          }
+        }),
+      ).pipe(Effect.forkChild);
+      yield* adapter.startSession({ threadId, cwd: process.cwd(), runtimeMode: "full-access" });
+      yield* adapter.sendTurn({ threadId, input: "watch the unit" });
+      yield* Deferred.await(turnCompleted).pipe(Effect.timeout("3 seconds"));
+      yield* Effect.sleep("200 millis");
+
+      assert.equal(events.filter((event) => event.type === "task.completed").length, 0);
+      assert.equal(
+        events.filter(
+          (event) => event.type === "task.started" && event.payload.taskId === liveTaskId,
+        ).length,
+        1,
+      );
+      yield* Fiber.interrupt(eventsFiber);
+      yield* adapter.stopSession(threadId);
+    }).pipe(TestClock.withLive),
+  );
+
   for (const taskType of ["monitor", "shell"] as const) {
     it.effect(`emits the ${taskType} background lifecycle`, () =>
       Effect.gen(function* () {
