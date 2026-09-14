@@ -219,6 +219,7 @@ describe("Grok task_completed notices", () => {
       completed?: boolean;
       output?: string;
       kind?: string;
+      status?: string;
     } = {},
   ) {
     return {
@@ -292,6 +293,37 @@ describe("Grok task_completed notices", () => {
     const completed = events.find((event) => event.type === "task.completed");
     expect(completed?.payload.status).toBe("failed");
     expect(tasks.size).toBe(0);
+  });
+
+  it("completes a known monitor when completed is true but lifecycle status is absent", () => {
+    const tasks = new Map<string, GrokBackgroundTaskRecord>();
+    const closedTaskIds = new Set<string>();
+    seedMonitor(tasks);
+    const events = buildGrokTaskCompletedEvents({
+      tasks,
+      notification: taskCompletedNotice({
+        exit_code: null,
+        signal: null,
+        explicitly_killed: false,
+      }),
+      closedTaskIds,
+    });
+    expect(events).toEqual([
+      {
+        type: "task.completed",
+        payload: {
+          taskId: monitorTaskId,
+          taskType: "monitor",
+          description: monitorDescription,
+          title: monitorDescription,
+          toolUseId: "call-1",
+          status: "completed",
+          summary: "DONE t3-draft",
+        },
+      },
+    ]);
+    expect(tasks.size).toBe(0);
+    expect(closedTaskIds.has(monitorTaskId)).toBe(true);
   });
 
   it("maps explicitly killed bash tasks to stopped", () => {

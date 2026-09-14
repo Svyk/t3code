@@ -548,6 +548,46 @@ it.layer(grokAdapterTestLayer)("GrokAdapterLive", (it) => {
     }).pipe(TestClock.withLive),
   );
 
+  it.effect("ignores task_completed notices with a missing sessionId", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("grok-monitor-missing-session");
+      const liveTaskId = "01a05f41-5107-7550-821e-79e8d1cd7687";
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockGrokWrapper({ T3_ACP_EMIT_GROK_MONITOR_MISSING_SESSION_NOTICE: "1" }),
+      );
+      const adapter = yield* makeTestAdapter(wrapperPath);
+      const events: ProviderRuntimeEvent[] = [];
+      const started = yield* Deferred.make<void>();
+      const eventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.gen(function* () {
+          events.push(event);
+          if (event.type === "task.started" && event.payload.taskId === liveTaskId) {
+            yield* Deferred.succeed(started, undefined);
+          }
+        }),
+      ).pipe(Effect.forkChild);
+      yield* adapter.startSession({ threadId, cwd: process.cwd(), runtimeMode: "full-access" });
+      yield* adapter.sendTurn({ threadId, input: "watch the unit" });
+      yield* Deferred.await(started).pipe(Effect.timeout("3 seconds"));
+      yield* Effect.sleep("500 millis");
+
+      assert.equal(
+        events.filter(
+          (event) => event.type === "task.completed" && event.payload.taskId === liveTaskId,
+        ).length,
+        0,
+      );
+      assert.equal(
+        events.filter(
+          (event) => event.type === "task.started" && event.payload.taskId === liveTaskId,
+        ).length,
+        1,
+      );
+      yield* Fiber.interrupt(eventsFiber);
+      yield* adapter.stopSession(threadId);
+    }).pipe(TestClock.withLive),
+  );
+
   it.effect("ignores task_completed notices from a foreign session", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("grok-monitor-foreign-session");

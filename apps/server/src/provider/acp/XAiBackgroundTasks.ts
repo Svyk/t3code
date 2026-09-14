@@ -159,7 +159,9 @@ export function buildGrokTaskCompletedEvents(input: {
       status = "stopped";
     }
   }
-  if (status === undefined || status === "running") return [];
+  if (status === undefined || status === "running") {
+    status = "completed";
+  }
 
   const summary = text(snapshot.output)
     ?.split("\n")

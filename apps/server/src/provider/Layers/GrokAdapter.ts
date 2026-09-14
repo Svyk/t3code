@@ -1158,7 +1158,7 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                   if (!ctx || ctx.stopped) return;
                   if (isRecord(params)) {
                     const sessionId = params.sessionId;
-                    if (typeof sessionId === "string" && sessionId !== ctx.acpSessionId) return;
+                    if (sessionId !== ctx.acpSessionId) return;
                     const update = params.update;
                     if (!isRecord(update) || update.sessionUpdate !== "task_completed") return;
                   } else {

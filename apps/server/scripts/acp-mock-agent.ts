@@ -50,6 +50,8 @@ const emitGrokMonitorLiveThenOrphanNotice =
   process.env.T3_ACP_EMIT_GROK_MONITOR_LIVE_THEN_ORPHAN_NOTICE === "1";
 const emitGrokMonitorForeignSessionNotice =
   process.env.T3_ACP_EMIT_GROK_MONITOR_FOREIGN_SESSION_NOTICE === "1";
+const emitGrokMonitorMissingSessionNotice =
+  process.env.T3_ACP_EMIT_GROK_MONITOR_MISSING_SESSION_NOTICE === "1";
 const emitGrokBackgroundTaskStarted = process.env.T3_ACP_EMIT_GROK_BACKGROUND_TASK_STARTED === "1";
 const emitForeignSessionUpdates = process.env.T3_ACP_EMIT_FOREIGN_SESSION_UPDATES === "1";
 const waitForResumeRelease = process.env.T3_ACP_WAIT_FOR_RESUME_RELEASE === "1";
@@ -1122,6 +1124,21 @@ const program = Effect.gen(function* () {
           ...grokMonitorTaskCompletedParams(),
           sessionId: "foreign-session-id-not-active",
         });
+        return yield* Effect.never;
+      }
+
+      if (emitGrokMonitorMissingSessionNotice) {
+        emitGrokMonitorStarted();
+        writeJsonRpcNotification("_x.ai/session/prompt_complete", {
+          sessionId: requestedSessionId,
+          promptId: promptIdFromRequestMeta(request) ?? "mock-xai-prompt-1",
+          stopReason: "end_turn",
+          agentResult: null,
+        });
+        yield* Effect.sleep("120 millis");
+        const { sessionId: _sessionId, ...taskCompletedWithoutSession } =
+          grokMonitorTaskCompletedParams();
+        writeJsonRpcNotification("_x.ai/task_completed", taskCompletedWithoutSession);
         return yield* Effect.never;
       }
 
