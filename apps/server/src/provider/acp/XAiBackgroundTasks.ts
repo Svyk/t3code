@@ -61,14 +61,30 @@ function taskAttribution(task: GrokBackgroundTaskRecord, turnId?: TurnId | undef
   return task.turnId !== undefined && task.turnId === turnId ? { turnId } : {};
 }
 
+/** Bounded FIFO of closed task ids; delete-then-add refreshes recency. */
+export function rememberClosedTaskId(
+  closed: Set<string>,
+  id: string,
+  cap: number | undefined = 500,
+): void {
+  closed.delete(id);
+  closed.add(id);
+  if (closed.size > cap) {
+    const oldest = closed.values().next().value;
+    if (oldest !== undefined) closed.delete(oldest);
+  }
+}
+
 function completeTask(
   tasks: Map<string, GrokBackgroundTaskRecord>,
   task: GrokBackgroundTaskRecord,
   status: "completed" | "failed" | "stopped",
   turnId?: TurnId | undefined,
   summary?: string,
+  closedTaskIds?: Set<string> | undefined,
 ): TaskEvent {
   tasks.delete(task.payload.taskId);
+  if (closedTaskIds) rememberClosedTaskId(closedTaskIds, task.payload.taskId);
   return {
     type: "task.completed",
     payload: { ...task.payload, status, ...(summary ? { summary } : {}) },
@@ -102,14 +118,32 @@ export function rememberPendingTaskCompletion(
   }
 }
 
+/** Pure decision helper for the ext notification handler. */
+export function decideGrokTaskCompletedNotice(input: {
+  readonly notification: unknown;
+  readonly tasks: ReadonlyMap<string, GrokBackgroundTaskRecord>;
+  readonly publishedTaskIds: ReadonlySet<string>;
+  readonly closedTaskIds: ReadonlySet<string>;
+}): { readonly action: "ignore" } | { readonly action: "close" | "park"; readonly taskId: string } {
+  const id = grokTaskCompletedNoticeId(input.notification);
+  if (!id) return { action: "ignore" };
+  if (input.closedTaskIds.has(id)) return { action: "ignore" };
+  if (input.tasks.has(id) && input.publishedTaskIds.has(id)) {
+    return { action: "close", taskId: id };
+  }
+  return { action: "park", taskId: id };
+}
+
 /** Close a known monitor/shell when Grok emits task_completed (ACP ext notification). */
 export function buildGrokTaskCompletedEvents(input: {
   readonly tasks: Map<string, GrokBackgroundTaskRecord>;
   readonly notification: unknown;
   readonly turnId?: TurnId | undefined;
+  readonly closedTaskIds?: Set<string> | undefined;
 }): TaskEvent[] {
   const id = grokTaskCompletedNoticeId(input.notification);
   if (!id) return [];
+  if (input.closedTaskIds?.has(id)) return [];
 
   const update = record(record(input.notification).update);
   const snapshot = record(update.task_snapshot);
@@ -132,7 +166,7 @@ export function buildGrokTaskCompletedEvents(input: {
     .find((line) => line.trim())
     ?.trim();
 
-  return [completeTask(input.tasks, task, status, input.turnId, summary)];
+  return [completeTask(input.tasks, task, status, input.turnId, summary, input.closedTaskIds)];
 }
 
 /** Map Grok's discriminated tool results, including notifications after the turn ends. */
@@ -143,8 +177,9 @@ export function buildGrokBackgroundTaskEvents(input: {
   readonly rawOutput: unknown;
   readonly toolCallStatus: string | undefined;
   readonly turnId?: TurnId | undefined;
+  readonly closedTaskIds?: Set<string> | undefined;
 }): TaskEvent[] {
-  const { tasks, toolCallId, toolCallStatus, turnId } = input;
+  const { tasks, toolCallId, toolCallStatus, turnId, closedTaskIds } = input;
   const output = record(input.rawOutput);
   const events: TaskEvent[] = [];
   if (
@@ -160,6 +195,7 @@ export function buildGrokBackgroundTaskEvents(input: {
     description: string,
     toolUseId?: string,
   ) => {
+    if (closedTaskIds?.has(id)) return undefined;
     const known = tasks.get(id);
     if (known) return known;
     const task: GrokBackgroundTaskRecord = {
@@ -182,7 +218,7 @@ export function buildGrokBackgroundTaskEvents(input: {
     status: "completed" | "failed" | "stopped",
     summary?: string,
   ) => {
-    events.push(completeTask(tasks, task, status, turnId, summary));
+    events.push(completeTask(tasks, task, status, turnId, summary, closedTaskIds));
   };
 
   if (output.type === "Monitor" && toolCallStatus === "completed") {
@@ -197,7 +233,7 @@ export function buildGrokBackgroundTaskEvents(input: {
     for (const value of Array.isArray(results) ? results : [output.Result]) {
       const result = record(value);
       const id = text(result.task_id);
-      if (!id) continue;
+      if (!id || closedTaskIds?.has(id)) continue;
       if (output.type === "KillTask") {
         const task = tasks.get(id);
         if (task && toolCallStatus === "completed" && result.outcome === "killed")
@@ -208,6 +244,7 @@ export function buildGrokBackgroundTaskEvents(input: {
       const status = lifecycle(result.status, result.exit_code);
       if (!command || !status || command.startsWith("[subagent:")) continue;
       const task = start(id, /^\[monitor[:\]]/.test(command) ? "monitor" : "shell", command);
+      if (!task) continue;
       const summary = text(result.output)
         ?.split("\n")
         .find((line) => line.trim())

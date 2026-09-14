@@ -1,10 +1,12 @@
 import { describe, expect, it } from "vite-plus/test";
-import { TurnId } from "@t3tools/contracts";
+import { RuntimeTaskId, TurnId } from "@t3tools/contracts";
 
 import {
   buildGrokBackgroundTaskEvents,
   buildGrokTaskCompletedEvents,
+  decideGrokTaskCompletedNotice,
   grokTaskCompletedNoticeId,
+  rememberClosedTaskId,
   rememberPendingTaskCompletion,
   type GrokBackgroundTaskRecord,
 } from "./XAiBackgroundTasks.ts";
@@ -324,13 +326,14 @@ describe("Grok task_completed notices", () => {
 
   it("ignores unknown task ids without starting a task", () => {
     const tasks = new Map<string, GrokBackgroundTaskRecord>();
+    seedMonitor(tasks);
     expect(
       buildGrokTaskCompletedEvents({
         tasks,
         notification: taskCompletedNotice({ task_id: "unknown-task" }),
       }),
     ).toEqual([]);
-    expect(tasks.size).toBe(0);
+    expect(tasks.size).toBe(1);
   });
 
   it("ignores unrelated session/update kinds", () => {
@@ -351,7 +354,7 @@ describe("Grok task_completed notices", () => {
     expect(tasks.size).toBe(1);
   });
 
-  it("deduplicates dual delivery across both methods", () => {
+  it("does not complete an already-closed task twice", () => {
     const tasks = new Map<string, GrokBackgroundTaskRecord>();
     seedMonitor(tasks);
     const notice = taskCompletedNotice();
@@ -360,6 +363,64 @@ describe("Grok task_completed notices", () => {
     expect(first).toHaveLength(1);
     expect(second).toEqual([]);
     expect(tasks.size).toBe(0);
+  });
+
+  it("with closedTaskIds: notice closes monitor then late polls emit nothing", () => {
+    const tasks = new Map<string, GrokBackgroundTaskRecord>();
+    const closedTaskIds = new Set<string>();
+    seedMonitor(tasks);
+    const notice = taskCompletedNotice();
+    const completed = buildGrokTaskCompletedEvents({
+      tasks,
+      notification: notice,
+      closedTaskIds,
+    });
+    expect(completed).toHaveLength(1);
+    expect(tasks.size).toBe(0);
+    expect(closedTaskIds.has(monitorTaskId)).toBe(true);
+
+    const terminalPoll = buildGrokBackgroundTaskEvents({
+      tasks,
+      toolCallId: "call-2",
+      rawInput: { description: monitorDescription },
+      rawOutput: {
+        type: "TaskOutput",
+        Result: {
+          task_id: monitorTaskId,
+          command: `[monitor] ${monitorDescription}`,
+          status: "completed",
+          exit_code: 0,
+          output: "late poll",
+        },
+      },
+      toolCallStatus: "completed",
+      closedTaskIds,
+    });
+    expect(terminalPoll).toEqual([]);
+
+    const runningPoll = buildGrokBackgroundTaskEvents({
+      tasks,
+      toolCallId: "call-3",
+      rawInput: { description: monitorDescription },
+      rawOutput: {
+        type: "TaskOutput",
+        Result: {
+          task_id: monitorTaskId,
+          command: `[monitor] ${monitorDescription}`,
+          status: "running",
+        },
+      },
+      toolCallStatus: "completed",
+      closedTaskIds,
+    });
+    expect(runningPoll).toEqual([]);
+
+    const secondNotice = buildGrokTaskCompletedEvents({
+      tasks,
+      notification: notice,
+      closedTaskIds,
+    });
+    expect(secondNotice).toEqual([]);
   });
 
   it.each([
@@ -417,6 +478,120 @@ describe("grokTaskCompletedNoticeId", () => {
     ["missing task_id", { task_id: " " }],
   ])("returns undefined for %s", (_label, overrides) => {
     expect(grokTaskCompletedNoticeId(notice(overrides))).toBeUndefined();
+  });
+});
+
+describe("rememberClosedTaskId", () => {
+  it("inserts a closed task id", () => {
+    const closed = new Set<string>();
+    rememberClosedTaskId(closed, "task-1");
+    expect(closed.has("task-1")).toBe(true);
+  });
+
+  it("re-inserting an existing id moves it to newest", () => {
+    const closed = new Set<string>();
+    rememberClosedTaskId(closed, "task-1");
+    rememberClosedTaskId(closed, "task-2");
+    rememberClosedTaskId(closed, "task-1");
+    expect([...closed]).toEqual(["task-2", "task-1"]);
+  });
+
+  it("evicts the oldest entry when exceeding the cap", () => {
+    const closed = new Set<string>();
+    for (let i = 0; i < 3; i++) {
+      rememberClosedTaskId(closed, `task-${i}`, 2);
+    }
+    expect([...closed]).toEqual(["task-1", "task-2"]);
+    expect(closed.has("task-0")).toBe(false);
+  });
+
+  it("uses a default cap of 500", () => {
+    const closed = new Set<string>();
+    for (let i = 0; i < 501; i++) {
+      rememberClosedTaskId(closed, `task-${i}`);
+    }
+    expect(closed.size).toBe(500);
+    expect(closed.has("task-0")).toBe(false);
+    expect(closed.has("task-500")).toBe(true);
+  });
+});
+
+describe("decideGrokTaskCompletedNotice", () => {
+  const monitorTaskId = "01a074d8-7c7f-7903-991f-1c9276e6e058";
+  const notice = {
+    sessionId: "session-1",
+    update: {
+      sessionUpdate: "task_completed",
+      task_snapshot: {
+        task_id: monitorTaskId,
+        kind: "monitor",
+        completed: true,
+      },
+    },
+  };
+  const taskRecord: GrokBackgroundTaskRecord = {
+    payload: {
+      taskId: RuntimeTaskId.make(monitorTaskId),
+      taskType: "monitor",
+      description: "Watch",
+      title: "Watch",
+    },
+    turnId: undefined,
+  };
+
+  it("ignores invalid notifications", () => {
+    expect(
+      decideGrokTaskCompletedNotice({
+        notification: { update: { sessionUpdate: "agent_message_chunk" } },
+        tasks: new Map(),
+        publishedTaskIds: new Set(),
+        closedTaskIds: new Set(),
+      }),
+    ).toEqual({ action: "ignore" });
+  });
+
+  it("ignores closed task ids", () => {
+    expect(
+      decideGrokTaskCompletedNotice({
+        notification: notice,
+        tasks: new Map([[monitorTaskId, taskRecord]]),
+        publishedTaskIds: new Set([monitorTaskId]),
+        closedTaskIds: new Set([monitorTaskId]),
+      }),
+    ).toEqual({ action: "ignore" });
+  });
+
+  it("closes known and published tasks", () => {
+    expect(
+      decideGrokTaskCompletedNotice({
+        notification: notice,
+        tasks: new Map([[monitorTaskId, taskRecord]]),
+        publishedTaskIds: new Set([monitorTaskId]),
+        closedTaskIds: new Set(),
+      }),
+    ).toEqual({ action: "close", taskId: monitorTaskId });
+  });
+
+  it("parks known-but-unpublished tasks", () => {
+    expect(
+      decideGrokTaskCompletedNotice({
+        notification: notice,
+        tasks: new Map([[monitorTaskId, taskRecord]]),
+        publishedTaskIds: new Set(),
+        closedTaskIds: new Set(),
+      }),
+    ).toEqual({ action: "park", taskId: monitorTaskId });
+  });
+
+  it("parks unknown tasks", () => {
+    expect(
+      decideGrokTaskCompletedNotice({
+        notification: notice,
+        tasks: new Map(),
+        publishedTaskIds: new Set(),
+        closedTaskIds: new Set(),
+      }),
+    ).toEqual({ action: "park", taskId: monitorTaskId });
   });
 });
 
