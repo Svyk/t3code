@@ -1194,8 +1194,10 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                       provider: PROVIDER,
                       threadId: ctx.threadId,
                     });
+                    if (taskEvent.type === "task.completed") {
+                      ctx.publishedTaskIds.delete(taskEvent.payload.taskId);
+                    }
                   }
-                  ctx.publishedTaskIds.delete(decision.taskId);
                 }),
               );
             yield* Effect.forEach(
